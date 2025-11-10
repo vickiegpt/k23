@@ -7,7 +7,7 @@
 
 use std::env;
 
-use vergen_git2::{BuildBuilder, CargoBuilder, Emitter, Git2Builder, RustcBuilder};
+use vergen_gitcl::{BuildBuilder, CargoBuilder, Emitter, GitclBuilder, RustcBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // For x86_64, compile the assembly entry point
@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .opt_level(true)
         .build()?;
     let rustc = RustcBuilder::default().semver(true).channel(true).build()?;
-    let git = Git2Builder::default()
+    let git = GitclBuilder::default()
         .sha(true)
         .commit_timestamp(true)
         .branch(true)

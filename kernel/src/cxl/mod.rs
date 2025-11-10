@@ -51,9 +51,35 @@ impl CXLManager {
 
     /// Discover and initialize CXL devices
     pub fn discover_devices(&self) -> Result<(), &'static str> {
-        // TODO: Implement PCI enumeration for CXL devices
-        // For now, this is a placeholder for future implementation
-        crate::tracing::info!("CXL device discovery not yet implemented");
+        tracing::info!("Starting CXL device discovery...");
+
+        // TODO: Implement full PCI enumeration for CXL devices
+        // This requires:
+        // 1. PCI configuration space access (via MMIO or I/O ports)
+        // 2. Scanning PCI buses for CXL-capable devices (vendor/device IDs)
+        // 3. Reading CXL DVSEC (Designated Vendor-Specific Extended Capability)
+        // 4. Initializing CXL.cache and CXL.mem protocols
+        // 5. Enumerating HDM (Host-managed Device Memory) decoders
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // For x86_64, we would typically:
+            // - Use MMCONFIG or legacy PCI config I/O ports (0xCF8/0xCFC)
+            // - Scan bus 0-255, device 0-31, function 0-7
+            // - Look for devices with CXL capabilities
+            tracing::debug!("x86_64: PCI enumeration for CXL devices not yet implemented");
+            tracing::debug!("Would scan PCI buses via MMCONFIG or I/O ports");
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            // For RISC-V, we would typically:
+            // - Use device tree or ACPI tables to find PCIe root complexes
+            // - Enumerate devices via ECAM (Enhanced Configuration Access Mechanism)
+            tracing::debug!("RISC-V: PCIe/CXL enumeration via device tree not yet implemented");
+        }
+
+        tracing::info!("CXL device discovery completed (0 devices found - enumeration not implemented)");
         Ok(())
     }
 }

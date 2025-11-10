@@ -2,7 +2,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use spin::RwLock;
 
@@ -18,20 +18,24 @@ enum RamFSInodeData {
 struct RamFSInode {
     meta: InodeMeta,
     data: RamFSInodeData,
+    // Reference back to the filesystem's inode map for creating new inodes
+    fs_inodes: Weak<RwLock<BTreeMap<InodeId, Arc<RwLock<RamFSInode>>>>>,
 }
 
 impl RamFSInode {
-    fn new_file() -> Self {
+    fn new_file(fs_inodes: Weak<RwLock<BTreeMap<InodeId, Arc<RwLock<RamFSInode>>>>>) -> Self {
         Self {
             meta: InodeMeta::new(InodeType::File),
             data: RamFSInodeData::File(Vec::new()),
+            fs_inodes,
         }
     }
 
-    fn new_dir() -> Self {
+    fn new_dir(fs_inodes: Weak<RwLock<BTreeMap<InodeId, Arc<RwLock<RamFSInode>>>>>) -> Self {
         Self {
             meta: InodeMeta::new(InodeType::Directory),
             data: RamFSInodeData::Directory(BTreeMap::new()),
+            fs_inodes,
         }
     }
 }
@@ -96,13 +100,24 @@ impl Inode for RamFSInode {
                     return Err("Entry already exists");
                 }
 
+                // Get the filesystem's inode map
+                let fs_inodes = self.fs_inodes.upgrade().ok_or("Filesystem dropped")?;
+
                 let new_inode = match inode_type {
-                    InodeType::File => RamFSInode::new_file(),
-                    InodeType::Directory => RamFSInode::new_dir(),
+                    InodeType::File => RamFSInode::new_file(self.fs_inodes.clone()),
+                    InodeType::Directory => RamFSInode::new_dir(self.fs_inodes.clone()),
                     _ => return Err("Unsupported inode type"),
                 };
 
                 let inode_id = new_inode.meta.id;
+                let arc_inode = Arc::new(RwLock::new(new_inode));
+
+                // Register the inode in the filesystem
+                let mut inodes = fs_inodes.write();
+                inodes.insert(inode_id, arc_inode);
+                drop(inodes);
+
+                // Add to directory entries
                 entries.insert(name.to_string(), inode_id);
                 Ok(inode_id)
             }
@@ -134,20 +149,24 @@ impl Inode for RamFSInode {
 
 /// RAM filesystem
 pub struct RamFS {
-    inodes: RwLock<BTreeMap<InodeId, Arc<RwLock<RamFSInode>>>>,
+    inodes: Arc<RwLock<BTreeMap<InodeId, Arc<RwLock<RamFSInode>>>>>,
     root_id: InodeId,
 }
 
 impl RamFS {
     pub fn new() -> Self {
-        let root = Arc::new(RwLock::new(RamFSInode::new_dir()));
+        let inodes = Arc::new(RwLock::new(BTreeMap::new()));
+        let inodes_weak = Arc::downgrade(&inodes);
+
+        let root = Arc::new(RwLock::new(RamFSInode::new_dir(inodes_weak)));
         let root_id = root.read().meta.id;
 
-        let mut inodes = BTreeMap::new();
-        inodes.insert(root_id, root);
+        let mut inodes_map = inodes.write();
+        inodes_map.insert(root_id, root);
+        drop(inodes_map);
 
         Self {
-            inodes: RwLock::new(inodes),
+            inodes,
             root_id,
         }
     }
@@ -159,16 +178,9 @@ impl RamFS {
         }
         drop(inodes);
 
-        // Create the inode if it doesn't exist
-        // This handles the case where an inode was created but not yet registered
-        let mut inodes = self.inodes.write();
-        if !inodes.contains_key(&id) {
-            // Create a new file inode with this ID
-            let inode = Arc::new(RwLock::new(RamFSInode::new_file()));
-            inodes.insert(id, inode);
-        }
-
-        Ok(())
+        // If we get here, the inode doesn't exist, which shouldn't happen anymore
+        // with the fixed create() method. Return an error instead of creating a dummy inode.
+        Err("Inode not found")
     }
 }
 

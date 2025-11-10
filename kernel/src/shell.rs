@@ -325,6 +325,22 @@ const SHUTDOWN: Command = Command::new("shutdown")
 // Current working directory (global for simplicity)
 static CURRENT_DIR: Mutex<&str> = Mutex::new("/");
 
+/// Helper function to resolve a path (relative or absolute) to an absolute path
+fn resolve_path(path: &str) -> String {
+    if path.starts_with('/') {
+        // Already absolute
+        path.to_string()
+    } else {
+        // Relative path - combine with current directory
+        let cwd = CURRENT_DIR.lock();
+        if *cwd == "/" {
+            format!("/{}", path)
+        } else {
+            format!("{}/{}", *cwd, path)
+        }
+    }
+}
+
 const PWD: Command = Command::new("pwd")
     .with_help("print current working directory.")
     .with_fn(|_| {
@@ -340,7 +356,7 @@ const LS: Command = Command::new("ls")
         let path = if ctx.current.is_empty() {
             CURRENT_DIR.lock().to_string()
         } else {
-            ctx.current.trim().to_string()
+            resolve_path(ctx.current.trim())
         };
 
         match crate::fs::get_vfs() {
@@ -377,12 +393,12 @@ const CAT: Command = Command::new("cat")
             return Err(ctx.invalid_argument("missing file operand"));
         }
 
-        let path = ctx.current.trim();
+        let path = resolve_path(ctx.current.trim());
 
         match crate::fs::get_vfs() {
             Some(vfs) => {
                 let flags = crate::fs::OpenFlags::read_only();
-                match vfs.open(path, flags) {
+                match vfs.open(&path, flags) {
                     Ok(fd) => {
                         let mut buffer = [0u8; 4096];
                         loop {
@@ -434,11 +450,11 @@ const MKDIR: Command = Command::new("mkdir")
             return Err(ctx.invalid_argument("missing directory operand"));
         }
 
-        let path = ctx.current.trim();
+        let path = resolve_path(ctx.current.trim());
 
         match crate::fs::get_vfs() {
             Some(vfs) => {
-                match vfs.mkdir(path) {
+                match vfs.mkdir(&path) {
                     Ok(_) => {
                         tracing::info!(target: "shell", "created directory '{}'", path);
                         Ok(())
@@ -464,11 +480,11 @@ const RM: Command = Command::new("rm")
             return Err(ctx.invalid_argument("missing file operand"));
         }
 
-        let path = ctx.current.trim();
+        let path = resolve_path(ctx.current.trim());
 
         match crate::fs::get_vfs() {
             Some(vfs) => {
-                match vfs.unlink(path) {
+                match vfs.unlink(&path) {
                     Ok(_) => {
                         tracing::info!(target: "shell", "removed '{}'", path);
                         Ok(())
@@ -494,7 +510,7 @@ const TOUCH: Command = Command::new("touch")
             return Err(ctx.invalid_argument("missing file operand"));
         }
 
-        let path = ctx.current.trim();
+        let path = resolve_path(ctx.current.trim());
 
         match crate::fs::get_vfs() {
             Some(vfs) => {
@@ -505,7 +521,7 @@ const TOUCH: Command = Command::new("touch")
                     truncate: false,
                     append: false,
                 };
-                match vfs.open(path, flags) {
+                match vfs.open(&path, flags) {
                     Ok(fd) => {
                         let _ = vfs.close(fd);
                         tracing::info!(target: "shell", "created file '{}'", path);
@@ -529,19 +545,19 @@ const CD: Command = Command::new("cd")
     .with_help("change the current working directory.")
     .with_fn(|ctx| {
         let path = if ctx.current.is_empty() {
-            "/"
+            "/".to_string()
         } else {
-            ctx.current.trim()
+            resolve_path(ctx.current.trim())
         };
 
         // Verify the directory exists
         match crate::fs::get_vfs() {
             Some(vfs) => {
-                match vfs.readdir(path) {
+                match vfs.readdir(&path) {
                     Ok(_) => {
                         let mut cwd = CURRENT_DIR.lock();
-                        *cwd = Box::leak(path.to_string().into_boxed_str());
-                        tracing::info!(target: "shell", "changed directory to '{}'", path);
+                        *cwd = Box::leak(path.into_boxed_str());
+                        tracing::info!(target: "shell", "changed directory to '{}'", *cwd);
                         Ok(())
                     }
                     Err(e) => {
@@ -566,7 +582,7 @@ const WRITE: Command = Command::new("write")
             return Err(ctx.invalid_argument("missing file or content"));
         }
 
-        let path = parts[0].trim();
+        let path = resolve_path(parts[0].trim());
         let content = parts[1];
 
         match crate::fs::get_vfs() {
@@ -578,7 +594,7 @@ const WRITE: Command = Command::new("write")
                     truncate: true,
                     append: false,
                 };
-                match vfs.open(path, flags) {
+                match vfs.open(&path, flags) {
                     Ok(fd) => {
                         match vfs.write(fd, content.as_bytes()) {
                             Ok(n) => {
@@ -613,7 +629,7 @@ const TREE: Command = Command::new("tree")
         let path = if ctx.current.is_empty() {
             CURRENT_DIR.lock().to_string()
         } else {
-            ctx.current.trim().to_string()
+            resolve_path(ctx.current.trim())
         };
 
         match crate::fs::get_vfs() {

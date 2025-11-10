@@ -30,11 +30,14 @@ mod allocator;
 mod arch;
 mod backtrace;
 mod bootargs;
+mod cxl;
 mod device_tree;
+mod fs;
 mod irq;
 mod mem;
 mod metrics;
 mod shell;
+mod smp;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -182,6 +185,28 @@ fn kmain(cpuid: usize, boot_info: &'static BootInfo, boot_ticks: u64) {
 
         // initialize the virtual memory subsystem
         mem::init(boot_info, &mut rng, frame_alloc).unwrap();
+
+        // initialize the file system
+        if let Err(e) = fs::init() {
+            tracing::error!("Failed to initialize VFS: {}", e);
+        } else {
+            tracing::info!("VFS initialized successfully");
+        }
+
+        // initialize CXL support
+        if let Err(e) = cxl::init() {
+            tracing::error!("Failed to initialize CXL: {}", e);
+        } else {
+            tracing::info!("CXL subsystem initialized successfully");
+        }
+
+        // initialize SMP support
+        let num_cpus = boot_info.cpu_mask.count_ones() as usize;
+        if let Err(e) = smp::init(num_cpus) {
+            tracing::error!("Failed to initialize SMP: {}", e);
+        } else {
+            tracing::info!("SMP subsystem initialized for {} CPUs", num_cpus);
+        }
 
         // perform LATE per-cpu, architecture-specific initialization
         // (e.g. setting the trap vector and enabling interrupts)

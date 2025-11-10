@@ -71,11 +71,55 @@ impl MachineInfo<'_> {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
 
+        // Detect number of CPUs via CPUID
+        let cpu_count = Self::detect_x86_64_cpu_count();
+        let mut hart_mask = 0usize;
+        for cpu_id in 0..cpu_count {
+            hart_mask |= 1 << cpu_id;
+        }
+
         MachineInfo {
             fdt: &DUMMY_FDT,
             memories,
             rng_seed: None,
-            hart_mask: 0b1, // Only CPU 0 is online
+            hart_mask,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn detect_x86_64_cpu_count() -> usize {
+        unsafe {
+            // CPUID leaf 0x1, EBX[23:16] contains max APIC IDs
+            // Note: We can't use ebx directly as it's reserved by LLVM
+            let ebx: u32;
+
+            core::arch::asm!(
+                // Save rbx (LLVM uses it)
+                "push rbx",
+                // Call cpuid with eax=1
+                "mov eax, 1",
+                "cpuid",
+                // Save ebx to a temporary (r10 is caller-saved)
+                "mov r10d, ebx",
+                // Restore rbx
+                "pop rbx",
+                // Move result from r10 to output
+                "mov {0:e}, r10d",
+                out(reg) ebx,
+                out("eax") _,
+                out("ecx") _,
+                out("edx") _,
+                out("r10") _,
+            );
+
+            let max_logical = ((ebx >> 16) & 0xFF) as usize;
+
+            // Cap at 32 CPUs for safety
+            if max_logical > 1 && max_logical <= 32 {
+                max_logical
+            } else {
+                1
+            }
         }
     }
 

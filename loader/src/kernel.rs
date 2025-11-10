@@ -41,7 +41,8 @@ impl Kernel<'static> {
 
         // For x86_64: The kernel is embedded in the loader which is identity-mapped.
         // For RISC-V: The kernel needs to be accessed through phys_off after MMU is on.
-        let base = if cfg!(target_arch = "x86_64") && phys_off != 0 {
+        let base = if cfg!(target_arch = "x86_64") {
+            // x86_64: always use kernel_addr directly (identity mapped)
             kernel_addr
         } else if cfg!(target_arch = "riscv64") {
             phys_off.checked_add(kernel_addr).unwrap()

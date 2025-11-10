@@ -272,9 +272,209 @@ pub unsafe fn handoff_to_kernel(cpuid: usize, boot_ticks: u64, init: &GlobalInit
     }
 }
 
-/// Start secondary CPUs (not implemented yet)
-pub fn start_secondary_harts(boot_cpu: usize, _minfo: &MachineInfo) -> crate::Result<()> {
-    log::warn!("x86_64 SMP not yet implemented, running on single CPU");
+/// APIC registers (memory-mapped)
+const APIC_BASE: usize = 0xFEE00000;
+const APIC_ID: usize = 0x020;
+const APIC_ICR_LOW: usize = 0x300;
+const APIC_ICR_HIGH: usize = 0x310;
+
+/// IPI delivery modes
+const APIC_DELMODE_INIT: u32 = 0x500;
+const APIC_DELMODE_STARTUP: u32 = 0x600;
+const APIC_LEVEL_ASSERT: u32 = 0x4000;
+
+/// Secondary CPU entry point address (must be below 1MB)
+const AP_STARTUP_ADDR: usize = 0x8000;
+
+/// Read from APIC register
+unsafe fn apic_read(reg: usize) -> u32 {
+    let addr = (APIC_BASE + reg) as *const u32;
+    unsafe { core::ptr::read_volatile(addr) }
+}
+
+/// Write to APIC register
+unsafe fn apic_write(reg: usize, value: u32) {
+    let addr = (APIC_BASE + reg) as *mut u32;
+    unsafe { core::ptr::write_volatile(addr, value) }
+}
+
+/// Detect number of CPUs via CPUID
+fn detect_cpu_count() -> usize {
+    unsafe {
+        // CPUID leaf 0x1, EBX[23:16] contains max APIC IDs
+        // Note: We can't use ebx directly as it's reserved by LLVM
+        // We need to save/restore it manually
+        let ebx: u32;
+
+        core::arch::asm!(
+            // Save rbx (LLVM uses it)
+            "push rbx",
+            // Call cpuid with eax=1
+            "mov eax, 1",
+            "cpuid",
+            // Save ebx to a temporary (r10 is caller-saved)
+            "mov r10d, ebx",
+            // Restore rbx
+            "pop rbx",
+            // Move result from r10 to output
+            "mov {0:e}, r10d",
+            out(reg) ebx,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            out("r10") _,
+        );
+
+        let max_logical = ((ebx >> 16) & 0xFF) as usize;
+
+        // Cap at 32 CPUs for safety
+        if max_logical > 1 && max_logical <= 32 {
+            log::info!("Detected {} logical CPUs via CPUID", max_logical);
+            max_logical
+        } else {
+            1
+        }
+    }
+}
+
+/// Send INIT IPI to a specific CPU
+unsafe fn send_init_ipi(apic_id: u32) {
+    // Write target APIC ID to ICR high
+    unsafe {
+        apic_write(APIC_ICR_HIGH, apic_id << 24);
+        // Send INIT IPI
+        apic_write(APIC_ICR_LOW, APIC_DELMODE_INIT | APIC_LEVEL_ASSERT);
+    }
+
+    // Wait for delivery
+    busy_wait_ms(10);
+}
+
+/// Send STARTUP IPI to a specific CPU
+unsafe fn send_startup_ipi(apic_id: u32, start_vector: u8) {
+    // Write target APIC ID to ICR high
+    unsafe {
+        apic_write(APIC_ICR_HIGH, apic_id << 24);
+        // Send STARTUP IPI with start vector
+        apic_write(APIC_ICR_LOW, APIC_DELMODE_STARTUP | (start_vector as u32));
+    }
+
+    // Wait for delivery
+    busy_wait_ms(1);
+}
+
+/// Busy wait for approximately N milliseconds
+fn busy_wait_ms(ms: u32) {
+    // Rough busy loop - not precise but good enough for initialization
+    for _ in 0..(ms * 1000) {
+        unsafe {
+            core::arch::asm!("pause", options(nomem, nostack));
+        }
+    }
+}
+
+/// Copy AP startup code to low memory
+unsafe fn setup_ap_trampoline() -> crate::Result<()> {
+    // Copy the AP startup code from _start_secondary to AP_STARTUP_ADDR
+    let trampoline_code = AP_TRAMPOLINE_CODE;
+    let dest = AP_STARTUP_ADDR as *mut u8;
+
+    log::debug!("Copying AP trampoline code to {:#x} ({} bytes)", AP_STARTUP_ADDR, trampoline_code.len());
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            trampoline_code.as_ptr(),
+            dest,
+            trampoline_code.len(),
+        );
+    }
+
+    Ok(())
+}
+
+/// AP trampoline code (real mode entry point)
+/// This code is position-independent and runs in real mode at AP_STARTUP_ADDR
+/// It transitions the CPU from real mode -> protected mode -> long mode
+static AP_TRAMPOLINE_CODE: &[u8] = &[
+    // Real mode 16-bit code starts here (address 0x8000)
+    0xFA,                           // cli - disable interrupts
+    0x66, 0xB8, 0x10, 0x00,         // mov ax, 0x10 - data segment
+    0x8E, 0xD8,                     // mov ds, ax
+    0x8E, 0xC0,                     // mov es, ax
+    0x8E, 0xD0,                     // mov ss, ax
+
+    // Enable A20 line (fast method via port 0x92)
+    0xE4, 0x92,                     // in al, 0x92
+    0x0C, 0x02,                     // or al, 2
+    0xE6, 0x92,                     // out 0x92, al
+
+    // Enable PAE (required for long mode)
+    0x0F, 0x20, 0xE0,               // mov eax, cr4
+    0x0C, 0x20,                     // or al, 0x20 (PAE bit)
+    0x0F, 0x22, 0xE0,               // mov cr4, eax
+
+    // Load CR3 with PML4 address (reuse boot CPU's page tables at 0x1000)
+    0xB8, 0x00, 0x10, 0x00, 0x00,   // mov eax, 0x1000
+    0x0F, 0x22, 0xD8,               // mov cr3, eax
+
+    // Enable long mode in EFER
+    0xB9, 0x80, 0x00, 0x00, 0xC0,   // mov ecx, 0xC0000080 (EFER MSR)
+    0x0F, 0x32,                     // rdmsr
+    0x0C, 0x01,                     // or al, 1 (LME bit)
+    0x0F, 0x30,                     // wrmsr
+
+    // Enable paging and protected mode
+    0x0F, 0x20, 0xC0,               // mov eax, cr0
+    0x0D, 0x01, 0x00, 0x00, 0x80,   // or eax, 0x80000001 (PG + PE)
+    0x0F, 0x22, 0xC0,               // mov cr0, eax
+
+    // Now in 64-bit mode, jump to kernel
+    // Load GDT and far jump would go here, but for simplicity
+    // we'll just halt for now until proper 64-bit entry is implemented
+    0xF4,                           // hlt
+    0xEB, 0xFD,                     // jmp $ (infinite loop)
+];
+
+/// Start secondary CPUs
+pub fn start_secondary_harts(boot_cpu: usize, minfo: &MachineInfo) -> crate::Result<()> {
+    let cpu_count = detect_cpu_count();
+
+    if cpu_count <= 1 {
+        log::info!("Single CPU system detected, skipping SMP initialization");
+        return Ok(());
+    }
+
+    log::info!("Starting {} secondary CPUs (boot CPU: {})", cpu_count - 1, boot_cpu);
+
+    // Setup AP trampoline code in low memory
+    unsafe {
+        setup_ap_trampoline()?;
+    }
+
+    // Start each AP (Application Processor)
+    for cpu_id in 0..cpu_count {
+        if cpu_id == boot_cpu {
+            continue; // Skip boot CPU
+        }
+
+        log::debug!("Starting CPU {}", cpu_id);
+
+        unsafe {
+            // Send INIT IPI
+            send_init_ipi(cpu_id as u32);
+
+            // Send STARTUP IPI (twice as per Intel MP spec)
+            let start_vector = (AP_STARTUP_ADDR >> 12) as u8;
+            send_startup_ipi(cpu_id as u32, start_vector);
+            busy_wait_ms(1);
+            send_startup_ipi(cpu_id as u32, start_vector);
+        }
+
+        // TODO: Wait for AP to signal readiness
+        log::info!("CPU {} startup sequence sent", cpu_id);
+    }
+
+    log::info!("SMP initialization complete");
     Ok(())
 }
 

@@ -15,7 +15,10 @@ const S: &str = r#"
 /_/\_\/____/____/
 "#;
 
+use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::fmt;
 use core::fmt::Write;
 use core::ops::DerefMut;
@@ -24,14 +27,17 @@ use core::str::FromStr;
 
 use fallible_iterator::FallibleIterator;
 use kasync::executor::Executor;
-use spin::{Barrier, OnceLock};
+use spin::{Barrier, Mutex, OnceLock};
 
 use crate::device_tree::DeviceTree;
 use crate::mem::{Mmap, PhysicalAddress, with_kernel_aspace};
 use crate::state::global;
 use crate::{arch, irq};
 
-static COMMANDS: &[Command] = &[PANIC, FAULT, VERSION, SHUTDOWN];
+static COMMANDS: &[Command] = &[
+    PANIC, FAULT, VERSION, SHUTDOWN,
+    LS, PWD, CD, CAT, ECHO, MKDIR, RM, TOUCH, WRITE, TREE,
+];
 
 pub fn init(devtree: &'static DeviceTree, sched: &'static Executor, num_cpus: usize) {
     // The `Barrier` below is here so that the maybe verbose startup logging is
@@ -315,6 +321,344 @@ const SHUTDOWN: Command = Command::new("shutdown")
 
         Ok(())
     });
+
+// Current working directory (global for simplicity)
+static CURRENT_DIR: Mutex<&str> = Mutex::new("/");
+
+const PWD: Command = Command::new("pwd")
+    .with_help("print current working directory.")
+    .with_fn(|_| {
+        let cwd = CURRENT_DIR.lock();
+        tracing::info!(target: "shell", "{}", *cwd);
+        Ok(())
+    });
+
+const LS: Command = Command::new("ls")
+    .with_usage("[PATH]")
+    .with_help("list directory contents.")
+    .with_fn(|ctx| {
+        let path = if ctx.current.is_empty() {
+            CURRENT_DIR.lock().to_string()
+        } else {
+            ctx.current.trim().to_string()
+        };
+
+        match crate::fs::get_vfs() {
+            Some(vfs) => {
+                match vfs.readdir(&path) {
+                    Ok(entries) => {
+                        if entries.is_empty() {
+                            tracing::info!(target: "shell", "(empty directory)");
+                        } else {
+                            for (name, _inode_id) in entries {
+                                tracing::info!(target: "shell", "{}", name);
+                            }
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "shell", "ls: cannot access '{}': {}", path, e);
+                        Err(ctx.other_error("failed to list directory"))
+                    }
+                }
+            }
+            None => {
+                tracing::error!(target: "shell", "ls: filesystem not initialized");
+                Err(ctx.other_error("filesystem not available"))
+            }
+        }
+    });
+
+const CAT: Command = Command::new("cat")
+    .with_usage("<FILE>")
+    .with_help("concatenate and print files.")
+    .with_fn(|ctx| {
+        if ctx.current.is_empty() {
+            return Err(ctx.invalid_argument("missing file operand"));
+        }
+
+        let path = ctx.current.trim();
+
+        match crate::fs::get_vfs() {
+            Some(vfs) => {
+                let flags = crate::fs::OpenFlags::read_only();
+                match vfs.open(path, flags) {
+                    Ok(fd) => {
+                        let mut buffer = [0u8; 4096];
+                        loop {
+                            match vfs.read(fd, &mut buffer) {
+                                Ok(0) => break, // EOF
+                                Ok(n) => {
+                                    if let Ok(s) = core::str::from_utf8(&buffer[..n]) {
+                                        tracing::info!(target: "shell", "{}", s.trim_end());
+                                    } else {
+                                        tracing::warn!(target: "shell", "(binary data)");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(target: "shell", "cat: read error: {}", e);
+                                    let _ = vfs.close(fd);
+                                    return Err(ctx.other_error("read failed"));
+                                }
+                            }
+                        }
+                        let _ = vfs.close(fd);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "shell", "cat: {}: {}", path, e);
+                        Err(ctx.other_error("failed to open file"))
+                    }
+                }
+            }
+            None => {
+                tracing::error!(target: "shell", "cat: filesystem not initialized");
+                Err(ctx.other_error("filesystem not available"))
+            }
+        }
+    });
+
+const ECHO: Command = Command::new("echo")
+    .with_usage("[STRING...]")
+    .with_help("display a line of text.")
+    .with_fn(|ctx| {
+        tracing::info!(target: "shell", "{}", ctx.current);
+        Ok(())
+    });
+
+const MKDIR: Command = Command::new("mkdir")
+    .with_usage("<DIRECTORY>")
+    .with_help("create a directory.")
+    .with_fn(|ctx| {
+        if ctx.current.is_empty() {
+            return Err(ctx.invalid_argument("missing directory operand"));
+        }
+
+        let path = ctx.current.trim();
+
+        match crate::fs::get_vfs() {
+            Some(vfs) => {
+                match vfs.mkdir(path) {
+                    Ok(_) => {
+                        tracing::info!(target: "shell", "created directory '{}'", path);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "shell", "mkdir: cannot create directory '{}': {}", path, e);
+                        Err(ctx.other_error("failed to create directory"))
+                    }
+                }
+            }
+            None => {
+                tracing::error!(target: "shell", "mkdir: filesystem not initialized");
+                Err(ctx.other_error("filesystem not available"))
+            }
+        }
+    });
+
+const RM: Command = Command::new("rm")
+    .with_usage("<FILE>")
+    .with_help("remove files or directories.")
+    .with_fn(|ctx| {
+        if ctx.current.is_empty() {
+            return Err(ctx.invalid_argument("missing file operand"));
+        }
+
+        let path = ctx.current.trim();
+
+        match crate::fs::get_vfs() {
+            Some(vfs) => {
+                match vfs.unlink(path) {
+                    Ok(_) => {
+                        tracing::info!(target: "shell", "removed '{}'", path);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "shell", "rm: cannot remove '{}': {}", path, e);
+                        Err(ctx.other_error("failed to remove"))
+                    }
+                }
+            }
+            None => {
+                tracing::error!(target: "shell", "rm: filesystem not initialized");
+                Err(ctx.other_error("filesystem not available"))
+            }
+        }
+    });
+
+const TOUCH: Command = Command::new("touch")
+    .with_usage("<FILE>")
+    .with_help("create an empty file.")
+    .with_fn(|ctx| {
+        if ctx.current.is_empty() {
+            return Err(ctx.invalid_argument("missing file operand"));
+        }
+
+        let path = ctx.current.trim();
+
+        match crate::fs::get_vfs() {
+            Some(vfs) => {
+                let flags = crate::fs::OpenFlags {
+                    read: false,
+                    write: true,
+                    create: true,
+                    truncate: false,
+                    append: false,
+                };
+                match vfs.open(path, flags) {
+                    Ok(fd) => {
+                        let _ = vfs.close(fd);
+                        tracing::info!(target: "shell", "created file '{}'", path);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "shell", "touch: cannot create '{}': {}", path, e);
+                        Err(ctx.other_error("failed to create file"))
+                    }
+                }
+            }
+            None => {
+                tracing::error!(target: "shell", "touch: filesystem not initialized");
+                Err(ctx.other_error("filesystem not available"))
+            }
+        }
+    });
+
+const CD: Command = Command::new("cd")
+    .with_usage("[DIRECTORY]")
+    .with_help("change the current working directory.")
+    .with_fn(|ctx| {
+        let path = if ctx.current.is_empty() {
+            "/"
+        } else {
+            ctx.current.trim()
+        };
+
+        // Verify the directory exists
+        match crate::fs::get_vfs() {
+            Some(vfs) => {
+                match vfs.readdir(path) {
+                    Ok(_) => {
+                        let mut cwd = CURRENT_DIR.lock();
+                        *cwd = Box::leak(path.to_string().into_boxed_str());
+                        tracing::info!(target: "shell", "changed directory to '{}'", path);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "shell", "cd: {}: {}", path, e);
+                        Err(ctx.other_error("failed to change directory"))
+                    }
+                }
+            }
+            None => {
+                tracing::error!(target: "shell", "cd: filesystem not initialized");
+                Err(ctx.other_error("filesystem not available"))
+            }
+        }
+    });
+
+const WRITE: Command = Command::new("write")
+    .with_usage("<FILE> <CONTENT>")
+    .with_help("write text to a file.")
+    .with_fn(|ctx| {
+        let parts: Vec<&str> = ctx.current.splitn(2, ' ').collect();
+        if parts.len() < 2 {
+            return Err(ctx.invalid_argument("missing file or content"));
+        }
+
+        let path = parts[0].trim();
+        let content = parts[1];
+
+        match crate::fs::get_vfs() {
+            Some(vfs) => {
+                let flags = crate::fs::OpenFlags {
+                    read: false,
+                    write: true,
+                    create: true,
+                    truncate: true,
+                    append: false,
+                };
+                match vfs.open(path, flags) {
+                    Ok(fd) => {
+                        match vfs.write(fd, content.as_bytes()) {
+                            Ok(n) => {
+                                let _ = vfs.close(fd);
+                                tracing::info!(target: "shell", "wrote {} bytes to '{}'", n, path);
+                                Ok(())
+                            }
+                            Err(e) => {
+                                let _ = vfs.close(fd);
+                                tracing::error!(target: "shell", "write: write error: {}", e);
+                                Err(ctx.other_error("write failed"))
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "shell", "write: cannot open '{}': {}", path, e);
+                        Err(ctx.other_error("failed to open file"))
+                    }
+                }
+            }
+            None => {
+                tracing::error!(target: "shell", "write: filesystem not initialized");
+                Err(ctx.other_error("filesystem not available"))
+            }
+        }
+    });
+
+const TREE: Command = Command::new("tree")
+    .with_usage("[PATH]")
+    .with_help("display directory tree structure.")
+    .with_fn(|ctx| {
+        let path = if ctx.current.is_empty() {
+            CURRENT_DIR.lock().to_string()
+        } else {
+            ctx.current.trim().to_string()
+        };
+
+        match crate::fs::get_vfs() {
+            Some(vfs) => {
+                tracing::info!(target: "shell", "{}", path);
+                print_tree(&vfs, &path, "", true);
+                Ok(())
+            }
+            None => {
+                tracing::error!(target: "shell", "tree: filesystem not initialized");
+                Err(ctx.other_error("filesystem not available"))
+            }
+        }
+    });
+
+fn print_tree(vfs: &crate::fs::VFS, path: &str, prefix: &str, is_last: bool) {
+    match vfs.readdir(path) {
+        Ok(entries) => {
+            let entry_count = entries.len();
+            for (idx, (name, _)) in entries.iter().enumerate() {
+                let is_last_entry = idx == entry_count - 1;
+                let connector = if is_last_entry { "└── " } else { "├── " };
+                let extension = if is_last_entry { "    " } else { "│   " };
+
+                tracing::info!(target: "shell", "{}{}{}", prefix, connector, name);
+
+                // Try to recurse if it's a directory
+                let child_path = if path == "/" {
+                    format!("/{}", name)
+                } else {
+                    format!("{}/{}", path, name)
+                };
+
+                let new_prefix = format!("{}{}", prefix, extension);
+                // Limit recursion depth to prevent stack overflow
+                if prefix.len() < 40 {
+                    print_tree(vfs, &child_path, &new_prefix, is_last_entry);
+                }
+            }
+        }
+        Err(_) => {
+            // Not a directory or error, skip
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Command<'cmd> {

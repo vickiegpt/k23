@@ -88,6 +88,7 @@ pub struct GlobalInitResult {
     stacks_alloc: StacksAllocation,
     maybe_tls_alloc: Option<TlsAllocation>,
     barrier: Barrier,
+    phys_offset: usize,
 }
 
 // Safety: *mut BootInfo isn't Send but `GlobalInitResult` will only ever we read from, so this is fine.
@@ -116,8 +117,6 @@ fn do_global_init(hartid: usize, opaque: *const c_void) -> GlobalInitResult {
     // Safety: TODO
     let minfo = unsafe { MachineInfo::from_dtb(opaque).expect("failed to parse machine info") };
     log::debug!("\n{minfo}");
-
-    arch::start_secondary_harts(hartid, &minfo).unwrap();
 
     let self_regions = SelfRegions::collect(&minfo);
     log::debug!("{self_regions:#x?}");
@@ -201,9 +200,10 @@ fn do_global_init(hartid: usize, opaque: *const c_void) -> GlobalInitResult {
                 core::ptr::copy_nonoverlapping(fdt_src.as_ptr(), dst, fdt_size);
             }
 
-            log::debug!("x86_64: Copied FDT to allocated frame at {:#x}", fdt_frame);
+            log::debug!("x86_64: Copied FDT ({} bytes) to allocated frame at {:#x}, range will be {:#x}..{:#x}",
+                fdt_size, fdt_frame, fdt_frame, fdt_frame + fdt_size);
 
-            Range::from(fdt_frame..fdt_frame + fdt_size)
+            Range::from(fdt_frame..(fdt_frame + fdt_size))
         }
 
         #[cfg(not(target_arch = "x86_64"))]
@@ -263,14 +263,27 @@ fn do_global_init(hartid: usize, opaque: *const c_void) -> GlobalInitResult {
         .checked_add(usize::try_from(kernel.elf_file.header.pt2.entry_point()).unwrap())
         .unwrap();
 
-    GlobalInitResult {
+    let result = GlobalInitResult {
         boot_info,
         kernel_entry,
         root_pgtable,
         maybe_tls_alloc,
         stacks_alloc,
         barrier: Barrier::new(minfo.hart_mask.count_ones() as usize),
+        phys_offset: phys_off,
+    };
+
+    // Start secondary CPUs (x86_64 only)
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Note: We use boot_ticks=0 here since secondary CPUs will use the same value
+        // The actual boot_ticks value will be passed when they call handoff_to_kernel
+        if let Err(e) = arch::start_secondary_harts(hartid, 0, &result) {
+            log::error!("Failed to start secondary CPUs: {:?}", e);
+        }
     }
+
+    result
 }
 
 #[derive(Debug)]

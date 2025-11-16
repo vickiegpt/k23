@@ -123,6 +123,8 @@ fn init_boot_info_memory_regions(
     });
 
     // Report the flattened device tree as a separate region.
+    log::debug!("Adding FDT region to boot info: {:#x}..{:#x} (size: {})",
+        fdt_phys.start, fdt_phys.end, fdt_phys.end - fdt_phys.start);
     push_region(MemoryRegion {
         range: fdt_phys,
         kind: MemoryRegionKind::FDT,

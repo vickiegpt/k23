@@ -306,6 +306,9 @@ fn locate_device_tree(boot_info: &BootInfo) -> (&'static [u8], Range<PhysicalAdd
         .find(|region| region.kind == MemoryRegionKind::FDT)
         .expect("no FDT region");
 
+    tracing::debug!("FDT region from boot_info: {:#x}..{:#x} (size: {})",
+        fdt.range.start, fdt.range.end, fdt.range.end.saturating_sub(fdt.range.start));
+
     let base = boot_info
         .physical_address_offset
         .checked_add(fdt.range.start)

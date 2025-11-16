@@ -286,16 +286,35 @@ const APIC_LEVEL_ASSERT: u32 = 0x4000;
 /// Secondary CPU entry point address (must be below 1MB)
 const AP_STARTUP_ADDR: usize = 0x8000;
 
+/// AP startup data structure (located at 0x7000)
+const AP_DATA_ADDR: usize = 0x7000;
+
+#[repr(C)]
+struct ApStartupData {
+    pml4_addr: u64,          // Offset 0x00: CR3 value
+    gdt_addr: u64,           // Offset 0x08: GDT base address
+    gdt_limit: u16,          // Offset 0x10: GDT limit
+    _padding: u16,
+    kernel_entry: u64,       // Offset 0x14: Kernel entry point
+    stack_top: u64,          // Offset 0x1C: Stack top
+    boot_info: u64,          // Offset 0x24: BootInfo pointer
+    boot_ticks: u64,         // Offset 0x2C: Boot ticks
+    tls_start: u64,          // Offset 0x34: TLS base address
+    cpu_started_flag: u64,   // Offset 0x3C: Flag set by AP when started
+}
+
 /// Read from APIC register
 unsafe fn apic_read(reg: usize) -> u32 {
     let addr = (APIC_BASE + reg) as *const u32;
     unsafe { core::ptr::read_volatile(addr) }
 }
 
-/// Write to APIC register
+/// Write to APIC register - direct access since APIC is identity-mapped
 unsafe fn apic_write(reg: usize, value: u32) {
     let addr = (APIC_BASE + reg) as *mut u32;
+    log::trace!("apic_write: reg={:#x} value={:#x} addr={:#x}", reg, value, addr);
     unsafe { core::ptr::write_volatile(addr, value) }
+    log::trace!("apic_write: write completed");
 }
 
 /// Detect number of CPUs via CPUID
@@ -339,24 +358,30 @@ fn detect_cpu_count() -> usize {
 
 /// Send INIT IPI to a specific CPU
 unsafe fn send_init_ipi(apic_id: u32) {
+    log::trace!("send_init_ipi: apic_id={}", apic_id);
     // Write target APIC ID to ICR high
     unsafe {
+        log::trace!("send_init_ipi: writing APIC_ICR_HIGH");
         apic_write(APIC_ICR_HIGH, apic_id << 24);
+        log::trace!("send_init_ipi: writing APIC_ICR_LOW");
         // Send INIT IPI
         apic_write(APIC_ICR_LOW, APIC_DELMODE_INIT | APIC_LEVEL_ASSERT);
+        log::trace!("send_init_ipi: APIC writes completed");
     }
 
+    log::trace!("send_init_ipi: starting wait");
     // Wait for delivery
     busy_wait_ms(10);
+    log::trace!("send_init_ipi: wait completed");
 }
 
 /// Send STARTUP IPI to a specific CPU
-unsafe fn send_startup_ipi(apic_id: u32, start_vector: u8) {
+unsafe fn send_startup_ipi(apic_id: u32, start_vector: u8, phys_off: usize) {
     // Write target APIC ID to ICR high
     unsafe {
-        apic_write(APIC_ICR_HIGH, apic_id << 24);
+        apic_write(APIC_ICR_HIGH, apic_id << 24, phys_off);
         // Send STARTUP IPI with start vector
-        apic_write(APIC_ICR_LOW, APIC_DELMODE_STARTUP | (start_vector as u32));
+        apic_write(APIC_ICR_LOW, APIC_DELMODE_STARTUP | (start_vector as u32), phys_off);
     }
 
     // Wait for delivery
@@ -374,81 +399,226 @@ fn busy_wait_ms(ms: u32) {
 }
 
 /// Copy AP startup code to low memory
-unsafe fn setup_ap_trampoline() -> crate::Result<()> {
-    // Copy the AP startup code from _start_secondary to AP_STARTUP_ADDR
-    let trampoline_code = AP_TRAMPOLINE_CODE;
-    let dest = AP_STARTUP_ADDR as *mut u8;
+unsafe fn setup_ap_trampoline(pml4_addr: usize, phys_off: usize) -> crate::Result<()> {
+    log::debug!("Setting up AP trampoline at {:#x}", AP_STARTUP_ADDR);
+    log::debug!("PML4 address: {:#x}, phys_off: {:#x}", pml4_addr, phys_off);
 
-    log::debug!("Copying AP trampoline code to {:#x} ({} bytes)", AP_STARTUP_ADDR, trampoline_code.len());
-
+    // Copy GDT to AP_DATA_ADDR + 0x100
+    // Use physical offset to access low memory
+    log::debug!("Copying GDT to {:#x} (virt: {:#x})", AP_DATA_ADDR + 0x100, phys_off + AP_DATA_ADDR + 0x100);
+    let gdt_dest = (phys_off + AP_DATA_ADDR + 0x100) as *mut u64;
     unsafe {
         core::ptr::copy_nonoverlapping(
-            trampoline_code.as_ptr(),
-            dest,
-            trampoline_code.len(),
+            AP_GDT.as_ptr(),
+            gdt_dest,
+            AP_GDT.len(),
         );
     }
+    log::debug!("GDT copied");
+
+    // Create GDT descriptor at AP_DATA_ADDR + 0x10
+    #[repr(C, packed)]
+    struct GdtDescriptor {
+        limit: u16,
+        base: u32,
+    }
+
+    let gdt_desc = GdtDescriptor {
+        limit: (AP_GDT.len() * 8 - 1) as u16,
+        base: (AP_DATA_ADDR + 0x100) as u32,
+    };
+
+    log::debug!("Writing GDT descriptor to {:#x}", AP_DATA_ADDR + 0x10);
+    let gdt_desc_dest = (phys_off + AP_DATA_ADDR + 0x10) as *mut GdtDescriptor;
+    unsafe {
+        core::ptr::write(gdt_desc_dest, gdt_desc);
+    }
+    log::debug!("GDT descriptor written");
+
+    // Write PML4 address to AP_DATA_ADDR
+    log::debug!("Writing PML4 address to {:#x}", AP_DATA_ADDR);
+    let pml4_dest = (phys_off + AP_DATA_ADDR) as *mut u64;
+    unsafe {
+        core::ptr::write(pml4_dest, pml4_addr as u64);
+    }
+    log::debug!("PML4 address written");
+
+    // Copy the AP trampoline code to AP_STARTUP_ADDR
+    log::debug!("Copying trampoline code ({} bytes) to {:#x}", AP_TRAMPOLINE_CODE.len(), AP_STARTUP_ADDR);
+    let code_dest = (phys_off + AP_STARTUP_ADDR) as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            AP_TRAMPOLINE_CODE.as_ptr(),
+            code_dest,
+            AP_TRAMPOLINE_CODE.len(),
+        );
+    }
+
+    log::debug!("AP trampoline setup complete: code at {:#x} ({} bytes), GDT at {:#x}, data at {:#x}",
+        AP_STARTUP_ADDR, AP_TRAMPOLINE_CODE.len(), AP_DATA_ADDR + 0x100, AP_DATA_ADDR);
 
     Ok(())
 }
 
+/// Minimal GDT for AP trampoline
+/// Located at AP_DATA_ADDR + 0x100
+static AP_GDT: &[u64] = &[
+    0x0000000000000000,  // Null descriptor
+    0x00AF9A000000FFFF,  // Code segment (64-bit, executable, readable)
+    0x00CF92000000FFFF,  // Data segment (writable)
+];
+
 /// AP trampoline code (real mode entry point)
-/// This code is position-independent and runs in real mode at AP_STARTUP_ADDR
-/// It transitions the CPU from real mode -> protected mode -> long mode
+/// This code transitions the CPU from real mode -> protected mode -> long mode
+/// Parameters are loaded from AP_DATA_ADDR structure
 static AP_TRAMPOLINE_CODE: &[u8] = &[
-    // Real mode 16-bit code starts here (address 0x8000)
-    0xFA,                           // cli - disable interrupts
-    0x66, 0xB8, 0x10, 0x00,         // mov ax, 0x10 - data segment
-    0x8E, 0xD8,                     // mov ds, ax
-    0x8E, 0xC0,                     // mov es, ax
-    0x8E, 0xD0,                     // mov ss, ax
+    // ===== 16-bit Real Mode Code (starts at 0x8000) =====
+    0xFA,                               // cli - disable interrupts
+    0x66, 0xB8, 0x00, 0x00,             // mov eax, 0 (clear segment registers)
+    0x8E, 0xD8,                         // mov ds, ax
+    0x8E, 0xC0,                         // mov es, ax
+    0x8E, 0xD0,                         // mov ss, ax
 
     // Enable A20 line (fast method via port 0x92)
-    0xE4, 0x92,                     // in al, 0x92
-    0x0C, 0x02,                     // or al, 2
-    0xE6, 0x92,                     // out 0x92, al
+    0xE4, 0x92,                         // in al, 0x92
+    0x0C, 0x02,                         // or al, 2
+    0xE6, 0x92,                         // out 0x92, al
+
+    // Load GDT pointer from AP_DATA_ADDR + 0x08
+    0x66, 0x0F, 0x01, 0x16,             // lgdt [0x7010] - load GDT
+    0x10, 0x70,                         // Address: AP_DATA_ADDR + 0x10
+
+    // Enable protected mode
+    0x0F, 0x20, 0xC0,                   // mov eax, cr0
+    0x66, 0x83, 0xC8, 0x01,             // or eax, 1 (PE bit)
+    0x0F, 0x22, 0xC0,                   // mov cr0, eax
+
+    // Far jump to 32-bit protected mode code
+    0x66, 0xEA,                         // jmp far ptr
+    0x30, 0x80, 0x00, 0x00,             // offset: 0x8030 (within trampoline)
+    0x08, 0x00,                         // segment: 0x08 (code selector)
+
+    // ===== 32-bit Protected Mode Code (starts at offset 0x30) =====
+    // Set up data segments
+    0x66, 0xB8, 0x10, 0x00,             // mov ax, 0x10 (data selector)
+    0x8E, 0xD8,                         // mov ds, ax
+    0x8E, 0xC0,                         // mov es, ax
+    0x8E, 0xD0,                         // mov ss, ax
 
     // Enable PAE (required for long mode)
-    0x0F, 0x20, 0xE0,               // mov eax, cr4
-    0x0C, 0x20,                     // or al, 0x20 (PAE bit)
-    0x0F, 0x22, 0xE0,               // mov cr4, eax
+    0x0F, 0x20, 0xE0,                   // mov eax, cr4
+    0x0D, 0x20, 0x06, 0x00, 0x00,       // or eax, 0x620 (PAE + OSFXSR + OSXMMEXCPT)
+    0x0F, 0x22, 0xE0,                   // mov cr4, eax
 
-    // Load CR3 with PML4 address (reuse boot CPU's page tables at 0x1000)
-    0xB8, 0x00, 0x10, 0x00, 0x00,   // mov eax, 0x1000
-    0x0F, 0x22, 0xD8,               // mov cr3, eax
+    // Load CR3 with PML4 address from AP_DATA_ADDR
+    0xA1, 0x00, 0x70, 0x00, 0x00,       // mov eax, [0x7000] - load pml4_addr
+    0x0F, 0x22, 0xD8,                   // mov cr3, eax
 
-    // Enable long mode in EFER
-    0xB9, 0x80, 0x00, 0x00, 0xC0,   // mov ecx, 0xC0000080 (EFER MSR)
-    0x0F, 0x32,                     // rdmsr
-    0x0C, 0x01,                     // or al, 1 (LME bit)
-    0x0F, 0x30,                     // wrmsr
+    // Enable long mode in EFER MSR
+    0xB9, 0x80, 0x00, 0x00, 0xC0,       // mov ecx, 0xC0000080 (EFER MSR)
+    0x0F, 0x32,                         // rdmsr
+    0x0D, 0x00, 0x01, 0x00, 0x00,       // or eax, 0x100 (LME bit)
+    0x0F, 0x30,                         // wrmsr
 
-    // Enable paging and protected mode
-    0x0F, 0x20, 0xC0,               // mov eax, cr0
-    0x0D, 0x01, 0x00, 0x00, 0x80,   // or eax, 0x80000001 (PG + PE)
-    0x0F, 0x22, 0xC0,               // mov cr0, eax
+    // Enable paging
+    0x0F, 0x20, 0xC0,                   // mov eax, cr0
+    0x0D, 0x01, 0x00, 0x01, 0x80,       // or eax, 0x80010001 (PG + WP + PE)
+    0x0F, 0x22, 0xC0,                   // mov cr0, eax
 
-    // Now in 64-bit mode, jump to kernel
-    // Load GDT and far jump would go here, but for simplicity
-    // we'll just halt for now until proper 64-bit entry is implemented
-    0xF4,                           // hlt
-    0xEB, 0xFD,                     // jmp $ (infinite loop)
+    // Far jump to 64-bit mode code
+    0xEA,                               // jmp far ptr
+    0x6E, 0x80, 0x00, 0x00,             // offset: 0x806E (within trampoline)
+    0x08, 0x00,                         // segment: 0x08 (64-bit code selector)
+
+    // ===== 64-bit Long Mode Code (starts at offset 0x6E) =====
+    // Load data segment
+    0x48, 0xB8,                         // mov rax, imm64 (data selector)
+    0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x8E, 0xD8,                         // mov ds, ax
+    0x8E, 0xC0,                         // mov es, ax
+    0x8E, 0xD0,                         // mov ss, ax
+
+    // Load parameters from AP_DATA_ADDR
+    0x48, 0xB8,                         // mov rax, imm64 (AP_DATA_ADDR = 0x7000)
+    0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    // Load kernel entry point
+    0x48, 0x8B, 0x78, 0x14,             // mov rdi, [rax + 0x14] - kernel_entry
+
+    // Load stack top
+    0x48, 0x8B, 0x60, 0x1C,             // mov rsp, [rax + 0x1C] - stack_top
+
+    // Load boot_info
+    0x48, 0x8B, 0x70, 0x24,             // mov rsi, [rax + 0x24] - boot_info
+
+    // Load boot_ticks
+    0x48, 0x8B, 0x50, 0x2C,             // mov rdx, [rax + 0x2C] - boot_ticks
+
+    // Set TLS (FS base) from tls_start
+    0xB9, 0x00, 0x01, 0x00, 0xC0,       // mov ecx, 0xC0000100 (FS_BASE MSR)
+    0x48, 0x8B, 0x40, 0x34,             // mov rax, [rax + 0x34] - tls_start
+    0x48, 0x89, 0xC2,                   // mov rdx, rax
+    0x48, 0xC1, 0xEA, 0x20,             // shr rdx, 32
+    0x0F, 0x30,                         // wrmsr
+
+    // Get CPU ID from APIC ID
+    0x48, 0xB8,                         // mov rax, imm64 (APIC_BASE + APIC_ID = 0xFEE00020)
+    0x20, 0x00, 0xE0, 0xFE, 0x00, 0x00, 0x00, 0x00,
+    0x8B, 0x00,                         // mov eax, [rax]
+    0xC1, 0xE8, 0x18,                   // shr eax, 24 - extract APIC ID
+    0x48, 0x89, 0xC7,                   // mov rdi, rax - CPU ID in rdi
+
+    // Reload rax with AP_DATA_ADDR
+    0x48, 0xB8,                         // mov rax, imm64
+    0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    // Mark CPU as started
+    0x48, 0xC7, 0x40, 0x3C, 0x01, 0x00, 0x00, 0x00, // mov qword [rax + 0x3C], 1
+
+    // Load kernel entry address and jump
+    0x48, 0x8B, 0x40, 0x14,             // mov rax, [rax + 0x14] - kernel_entry
+    0xFF, 0xE0,                         // jmp rax
 ];
 
 /// Start secondary CPUs
-pub fn start_secondary_harts(boot_cpu: usize, minfo: &MachineInfo) -> crate::Result<()> {
+pub fn start_secondary_harts(
+    boot_cpu: usize,
+    boot_ticks: u64,
+    init: &GlobalInitResult,
+) -> crate::Result<()> {
     let cpu_count = detect_cpu_count();
 
     if cpu_count <= 1 {
-        log::info!("Single CPU system detected, skipping SMP initialization");
+        log::debug!("Single CPU system, skipping SMP initialization");
         return Ok(());
     }
 
     log::info!("Starting {} secondary CPUs (boot CPU: {})", cpu_count - 1, boot_cpu);
 
-    // Setup AP trampoline code in low memory
+    // Setup AP trampoline code in low memory with current PML4
+    // Use physical offset to access low memory through the phys mem mapping
     unsafe {
-        setup_ap_trampoline()?;
+        setup_ap_trampoline(init.root_pgtable, init.phys_offset)?;
+    }
+
+    // Fill in the AP startup data structure
+    let ap_data = (init.phys_offset + AP_DATA_ADDR) as *mut ApStartupData;
+    unsafe {
+        core::ptr::write(
+            ap_data,
+            ApStartupData {
+                pml4_addr: init.root_pgtable as u64,
+                gdt_addr: (AP_DATA_ADDR + 0x100) as u64,
+                gdt_limit: (AP_GDT.len() * 8 - 1) as u16,
+                _padding: 0,
+                kernel_entry: init.kernel_entry as u64,
+                stack_top: 0, // Will be set per-CPU
+                boot_info: init.boot_info as usize as u64,
+                boot_ticks,
+                tls_start: 0, // Will be set per-CPU
+                cpu_started_flag: 0,
+            },
+        );
     }
 
     // Start each AP (Application Processor)
@@ -459,19 +629,58 @@ pub fn start_secondary_harts(boot_cpu: usize, minfo: &MachineInfo) -> crate::Res
 
         log::debug!("Starting CPU {}", cpu_id);
 
-        unsafe {
-            // Send INIT IPI
-            send_init_ipi(cpu_id as u32);
+        // Get stack and TLS for this CPU
+        let stack = init.stacks_alloc.region_for_cpu(cpu_id);
+        let tls = init
+            .maybe_tls_alloc
+            .as_ref()
+            .map(|tls| tls.region_for_hart(cpu_id))
+            .unwrap_or_default();
 
-            // Send STARTUP IPI (twice as per Intel MP spec)
-            let start_vector = (AP_STARTUP_ADDR >> 12) as u8;
-            send_startup_ipi(cpu_id as u32, start_vector);
-            busy_wait_ms(1);
-            send_startup_ipi(cpu_id as u32, start_vector);
+        log::debug!("CPU {} stack: {:#x}..{:#x}, TLS: {:#x}..{:#x}",
+            cpu_id, stack.start, stack.end, tls.start, tls.end);
+
+        // Update AP startup data for this specific CPU
+        let ap_data = (init.phys_offset + AP_DATA_ADDR) as *mut ApStartupData;
+        unsafe {
+            (*ap_data).stack_top = stack.end as u64;
+            (*ap_data).tls_start = tls.start as u64;
+            (*ap_data).cpu_started_flag = 0;
         }
 
-        // TODO: Wait for AP to signal readiness
-        log::info!("CPU {} startup sequence sent", cpu_id);
+        log::debug!("Sending INIT IPI to CPU {}", cpu_id);
+        unsafe {
+            // Send INIT IPI
+            send_init_ipi(cpu_id as u32, init.phys_offset);
+
+            // Wait 10ms for INIT to be processed
+            busy_wait_ms(10);
+
+            log::debug!("Sending STARTUP IPI to CPU {} (vector {:#x})", cpu_id, AP_STARTUP_ADDR >> 12);
+            // Send STARTUP IPI (twice as per Intel MP spec)
+            let start_vector = (AP_STARTUP_ADDR >> 12) as u8;
+            send_startup_ipi(cpu_id as u32, start_vector, init.phys_offset);
+            busy_wait_ms(1);
+            send_startup_ipi(cpu_id as u32, start_vector, init.phys_offset);
+        }
+        log::debug!("Waiting for CPU {} to start...", cpu_id);
+
+        // Wait for AP to signal startup (with timeout)
+        let timeout_ms = 100;
+        let mut elapsed = 0;
+        while elapsed < timeout_ms {
+            let flag = unsafe { (*((init.phys_offset + AP_DATA_ADDR) as *const ApStartupData)).cpu_started_flag };
+            if flag != 0 {
+                log::info!("CPU {} started successfully", cpu_id);
+                break;
+            }
+            unsafe { busy_wait_ms(1) };
+            elapsed += 1;
+        }
+
+        if elapsed >= timeout_ms {
+            log::warn!("CPU {} did not signal startup within timeout", cpu_id);
+        }
     }
 
     log::info!("SMP initialization complete");

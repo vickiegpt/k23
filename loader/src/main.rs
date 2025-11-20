@@ -180,6 +180,14 @@ fn do_global_init(hartid: usize, opaque: *const c_void) -> GlobalInitResult {
         log::trace!("activated.");
     }
 
+    // Map the APIC for SMP initialization (x86_64 only)
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            arch::map_apic(root_pgtable, &mut frame_alloc, phys_off).unwrap();
+        }
+    }
+
     // For x86_64, now allocate persistent memory for the FDT after MMU is active
     let fdt_phys = {
         #[cfg(target_arch = "x86_64")]

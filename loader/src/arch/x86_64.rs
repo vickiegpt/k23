@@ -289,12 +289,12 @@ const AP_STARTUP_ADDR: usize = 0x8000;
 /// AP startup data structure (located at 0x7000)
 const AP_DATA_ADDR: usize = 0x7000;
 
-#[repr(C)]
+#[repr(C, packed)]
 struct ApStartupData {
     pml4_addr: u64,          // Offset 0x00: CR3 value
     gdt_addr: u64,           // Offset 0x08: GDT base address
     gdt_limit: u16,          // Offset 0x10: GDT limit
-    _padding: u16,
+    _padding: u16,           // Offset 0x12: Padding
     kernel_entry: u64,       // Offset 0x14: Kernel entry point
     stack_top: u64,          // Offset 0x1C: Stack top
     boot_info: u64,          // Offset 0x24: BootInfo pointer
@@ -312,7 +312,7 @@ unsafe fn apic_read(reg: usize) -> u32 {
 /// Write to APIC register - direct access since APIC is identity-mapped
 unsafe fn apic_write(reg: usize, value: u32) {
     let addr = (APIC_BASE + reg) as *mut u32;
-    log::trace!("apic_write: reg={:#x} value={:#x} addr={:#x}", reg, value, addr);
+    log::trace!("apic_write: reg={:#x} value={:#x} addr={:#x}", reg, value, addr as usize);
     unsafe { core::ptr::write_volatile(addr, value) }
     log::trace!("apic_write: write completed");
 }
@@ -376,12 +376,12 @@ unsafe fn send_init_ipi(apic_id: u32) {
 }
 
 /// Send STARTUP IPI to a specific CPU
-unsafe fn send_startup_ipi(apic_id: u32, start_vector: u8, phys_off: usize) {
+unsafe fn send_startup_ipi(apic_id: u32, start_vector: u8) {
     // Write target APIC ID to ICR high
     unsafe {
-        apic_write(APIC_ICR_HIGH, apic_id << 24, phys_off);
+        apic_write(APIC_ICR_HIGH, apic_id << 24);
         // Send STARTUP IPI with start vector
-        apic_write(APIC_ICR_LOW, APIC_DELMODE_STARTUP | (start_vector as u32), phys_off);
+        apic_write(APIC_ICR_LOW, APIC_DELMODE_STARTUP | (start_vector as u32));
     }
 
     // Wait for delivery
@@ -416,7 +416,7 @@ unsafe fn setup_ap_trampoline(pml4_addr: usize, phys_off: usize) -> crate::Resul
     }
     log::debug!("GDT copied");
 
-    // Create GDT descriptor at AP_DATA_ADDR + 0x10
+    // Create GDT descriptor at AP_DATA_ADDR + 0x50 (avoid conflict with ApStartupData)
     #[repr(C, packed)]
     struct GdtDescriptor {
         limit: u16,
@@ -428,8 +428,8 @@ unsafe fn setup_ap_trampoline(pml4_addr: usize, phys_off: usize) -> crate::Resul
         base: (AP_DATA_ADDR + 0x100) as u32,
     };
 
-    log::debug!("Writing GDT descriptor to {:#x}", AP_DATA_ADDR + 0x10);
-    let gdt_desc_dest = (phys_off + AP_DATA_ADDR + 0x10) as *mut GdtDescriptor;
+    log::debug!("Writing GDT descriptor to {:#x}", AP_DATA_ADDR + 0x50);
+    let gdt_desc_dest = (phys_off + AP_DATA_ADDR + 0x50) as *mut GdtDescriptor;
     unsafe {
         core::ptr::write(gdt_desc_dest, gdt_desc);
     }
@@ -462,10 +462,12 @@ unsafe fn setup_ap_trampoline(pml4_addr: usize, phys_off: usize) -> crate::Resul
 
 /// Minimal GDT for AP trampoline
 /// Located at AP_DATA_ADDR + 0x100
+/// Selectors: 0x00=null, 0x08=32-bit code, 0x10=64-bit code, 0x18=data
 static AP_GDT: &[u64] = &[
-    0x0000000000000000,  // Null descriptor
-    0x00AF9A000000FFFF,  // Code segment (64-bit, executable, readable)
-    0x00CF92000000FFFF,  // Data segment (writable)
+    0x0000000000000000,  // 0x00: Null descriptor
+    0x00CF9A000000FFFF,  // 0x08: 32-bit code segment (for protected mode)
+    0x00AF9A000000FFFF,  // 0x10: 64-bit code segment (for long mode)
+    0x00CF92000000FFFF,  // 0x18: Data segment (writable)
 ];
 
 /// AP trampoline code (real mode entry point)
@@ -484,9 +486,9 @@ static AP_TRAMPOLINE_CODE: &[u8] = &[
     0x0C, 0x02,                         // or al, 2
     0xE6, 0x92,                         // out 0x92, al
 
-    // Load GDT pointer from AP_DATA_ADDR + 0x08
-    0x66, 0x0F, 0x01, 0x16,             // lgdt [0x7010] - load GDT
-    0x10, 0x70,                         // Address: AP_DATA_ADDR + 0x10
+    // Load GDT pointer from AP_DATA_ADDR + 0x50
+    0x66, 0x0F, 0x01, 0x16,             // lgdt [0x7050] - load GDT
+    0x50, 0x70,                         // Address: AP_DATA_ADDR + 0x50
 
     // Enable protected mode
     0x0F, 0x20, 0xC0,                   // mov eax, cr0
@@ -500,7 +502,7 @@ static AP_TRAMPOLINE_CODE: &[u8] = &[
 
     // ===== 32-bit Protected Mode Code (starts at offset 0x30) =====
     // Set up data segments
-    0x66, 0xB8, 0x10, 0x00,             // mov ax, 0x10 (data selector)
+    0x66, 0xB8, 0x18, 0x00,             // mov ax, 0x18 (data selector)
     0x8E, 0xD8,                         // mov ds, ax
     0x8E, 0xC0,                         // mov es, ax
     0x8E, 0xD0,                         // mov ss, ax
@@ -528,12 +530,12 @@ static AP_TRAMPOLINE_CODE: &[u8] = &[
     // Far jump to 64-bit mode code
     0xEA,                               // jmp far ptr
     0x6E, 0x80, 0x00, 0x00,             // offset: 0x806E (within trampoline)
-    0x08, 0x00,                         // segment: 0x08 (64-bit code selector)
+    0x10, 0x00,                         // segment: 0x10 (64-bit code selector)
 
     // ===== 64-bit Long Mode Code (starts at offset 0x6E) =====
     // Load data segment
     0x48, 0xB8,                         // mov rax, imm64 (data selector)
-    0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x8E, 0xD8,                         // mov ds, ax
     0x8E, 0xC0,                         // mov es, ax
     0x8E, 0xD0,                         // mov ss, ax
@@ -579,6 +581,47 @@ static AP_TRAMPOLINE_CODE: &[u8] = &[
     0x48, 0x8B, 0x40, 0x14,             // mov rax, [rax + 0x14] - kernel_entry
     0xFF, 0xE0,                         // jmp rax
 ];
+
+/// Map the APIC region (identity-mapped for direct access)
+/// This must be called during global init while frame_alloc is still available
+pub unsafe fn map_apic(root_pgtable: usize, frame_alloc: &mut crate::frame_alloc::FrameAllocator, phys_off: usize) -> crate::Result<()> {
+    use core::num::NonZeroUsize;
+    log::debug!("Mapping APIC at {:#x}", APIC_BASE);
+
+    // Map a single page for the APIC (identity-mapped)
+    unsafe {
+        map_contiguous(
+            root_pgtable,
+            frame_alloc,
+            APIC_BASE,  // virtual address
+            APIC_BASE,  // physical address (identity-mapped)
+            NonZeroUsize::new(PAGE_SIZE).unwrap(),
+            Flags::READ | Flags::WRITE,
+            phys_off,
+        )?;
+    }
+
+    log::debug!("APIC mapped successfully");
+
+    // Also map the low memory region for AP trampoline (0x0000 - 0x10000)
+    // This is needed so APs can access the trampoline code and data after enabling paging
+    log::debug!("Mapping low memory for AP trampoline");
+    unsafe {
+        // Map first 64KB identity-mapped (covers 0x7000 trampoline data and 0x8000 trampoline code)
+        map_contiguous(
+            root_pgtable,
+            frame_alloc,
+            0x0000,     // virtual address
+            0x0000,     // physical address (identity-mapped)
+            NonZeroUsize::new(0x10000).unwrap(),  // 64KB
+            Flags::READ | Flags::WRITE | Flags::EXECUTE,
+            phys_off,
+        )?;
+    }
+    log::debug!("Low memory mapped successfully");
+
+    Ok(())
+}
 
 /// Start secondary CPUs
 pub fn start_secondary_harts(
@@ -643,15 +686,15 @@ pub fn start_secondary_harts(
         // Update AP startup data for this specific CPU
         let ap_data = (init.phys_offset + AP_DATA_ADDR) as *mut ApStartupData;
         unsafe {
-            (*ap_data).stack_top = stack.end as u64;
-            (*ap_data).tls_start = tls.start as u64;
-            (*ap_data).cpu_started_flag = 0;
+            core::ptr::addr_of_mut!((*ap_data).stack_top).write_unaligned(stack.end as u64);
+            core::ptr::addr_of_mut!((*ap_data).tls_start).write_unaligned(tls.start as u64);
+            core::ptr::addr_of_mut!((*ap_data).cpu_started_flag).write_unaligned(0);
         }
 
         log::debug!("Sending INIT IPI to CPU {}", cpu_id);
         unsafe {
             // Send INIT IPI
-            send_init_ipi(cpu_id as u32, init.phys_offset);
+            send_init_ipi(cpu_id as u32);
 
             // Wait 10ms for INIT to be processed
             busy_wait_ms(10);
@@ -659,9 +702,9 @@ pub fn start_secondary_harts(
             log::debug!("Sending STARTUP IPI to CPU {} (vector {:#x})", cpu_id, AP_STARTUP_ADDR >> 12);
             // Send STARTUP IPI (twice as per Intel MP spec)
             let start_vector = (AP_STARTUP_ADDR >> 12) as u8;
-            send_startup_ipi(cpu_id as u32, start_vector, init.phys_offset);
+            send_startup_ipi(cpu_id as u32, start_vector);
             busy_wait_ms(1);
-            send_startup_ipi(cpu_id as u32, start_vector, init.phys_offset);
+            send_startup_ipi(cpu_id as u32, start_vector);
         }
         log::debug!("Waiting for CPU {} to start...", cpu_id);
 
@@ -669,12 +712,15 @@ pub fn start_secondary_harts(
         let timeout_ms = 100;
         let mut elapsed = 0;
         while elapsed < timeout_ms {
-            let flag = unsafe { (*((init.phys_offset + AP_DATA_ADDR) as *const ApStartupData)).cpu_started_flag };
+            let ap_data_ptr = (init.phys_offset + AP_DATA_ADDR) as *const ApStartupData;
+            let flag = unsafe {
+                core::ptr::addr_of!((*ap_data_ptr).cpu_started_flag).read_unaligned()
+            };
             if flag != 0 {
                 log::info!("CPU {} started successfully", cpu_id);
                 break;
             }
-            unsafe { busy_wait_ms(1) };
+            busy_wait_ms(1);
             elapsed += 1;
         }
 

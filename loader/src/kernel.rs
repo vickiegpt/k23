@@ -61,9 +61,34 @@ impl Kernel<'static> {
                 .expect("missing .loader_config section");
             let raw = section.raw_data(&elf_file);
 
+            log::debug!(
+                "loader_config section: addr={:#x}, offset={:#x}, size={}, raw_ptr={:#x}, raw_len={}",
+                section.address(),
+                section.offset(),
+                section.size(),
+                raw.as_ptr() as usize,
+                raw.len()
+            );
+
+            // Print first 8 bytes as hex
+            if raw.len() >= 8 {
+                log::debug!(
+                    "loader_config raw bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                    raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]
+                );
+            }
+
             let ptr: *const LoaderConfig = raw.as_ptr().cast();
             // Safety: kernel is inlined into the loader, so ptr is always valid
             let cfg = unsafe { &*ptr };
+
+            // Print the raw u32 values to see what's being read
+            if raw.len() >= 8 {
+                let magic_val = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                let stack_val = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+                log::debug!("loader_config magic={:#x} (expected {:#x}), stack_pages={}",
+                    magic_val, 0x6766636cu32, stack_val);
+            }
 
             cfg.assert_valid();
             cfg

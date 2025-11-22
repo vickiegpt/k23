@@ -34,6 +34,15 @@ impl LoaderConfig {
         }
     }
 
+    /// Creates a new configuration with the specified stack size.
+    #[must_use]
+    pub const fn with_stack_size(kernel_stack_size_pages: u32) -> Self {
+        Self {
+            magic: CFG_MAGIC,
+            kernel_stack_size_pages,
+        }
+    }
+
     /// Asserts that the configuration is valid.
     ///
     /// # Panics

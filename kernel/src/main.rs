@@ -79,13 +79,11 @@ pub const INITIAL_HEAP_SIZE_PAGES: usize = 4096 * 2; // 32 MiB
 
 pub type Result<T> = anyhow::Result<T>;
 
-#[used(linker)]
+// Loader config - using LoaderConfig type for proper alignment
+#[used]
 #[unsafe(link_section = ".loader_config")]
-static LOADER_CONFIG: LoaderConfig = {
-    let mut cfg = LoaderConfig::new_default();
-    cfg.kernel_stack_size_pages = STACK_SIZE_PAGES;
-    cfg
-};
+#[unsafe(no_mangle)]
+pub static LOADER_CONFIG: LoaderConfig = LoaderConfig::with_stack_size(STACK_SIZE_PAGES);
 
 // This is the real kernel entry from the loader
 // On x86_64, we need an assembly trampoline to preserve register values
@@ -98,6 +96,19 @@ extern "C" fn _start(cpuid: usize, boot_info: &'static BootInfo, boot_ticks: u64
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 extern "C" fn _rust_start(cpuid: usize, boot_info_ptr: usize, boot_ticks: u64) -> ! {
+    // Early debug output to serial port before anything else
+    unsafe {
+        // Write "K23\n" to COM1 to confirm kernel entry
+        for byte in b"K23 kernel entry\n" {
+            core::arch::asm!(
+                "out dx, al",
+                in("al") *byte,
+                in("dx") 0x3F8u16,
+                options(nomem, preserves_flags)
+            );
+        }
+    }
+
     let boot_info = unsafe { &*(boot_info_ptr as *const BootInfo) };
     _rust_start_impl(cpuid, boot_info, boot_ticks)
 }
@@ -300,25 +311,37 @@ fn allocatable_memory_regions(boot_info: &BootInfo) -> ArrayVec<Range<PhysicalAd
 }
 
 fn locate_device_tree(boot_info: &BootInfo) -> (&'static [u8], Range<PhysicalAddress>) {
-    let fdt = boot_info
-        .memory_regions
-        .iter()
-        .find(|region| region.kind == MemoryRegionKind::FDT)
-        .expect("no FDT region");
+    // x86_64 doesn't use FDT, return empty slice
+    #[cfg(target_arch = "x86_64")]
+    {
+        return (
+            &[],
+            Range::from(PhysicalAddress::new(0)..PhysicalAddress::new(0)),
+        );
+    }
 
-    tracing::debug!("FDT region from boot_info: {:#x}..{:#x} (size: {})",
-        fdt.range.start, fdt.range.end, fdt.range.end.saturating_sub(fdt.range.start));
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let fdt = boot_info
+            .memory_regions
+            .iter()
+            .find(|region| region.kind == MemoryRegionKind::FDT)
+            .expect("no FDT region");
 
-    let base = boot_info
-        .physical_address_offset
-        .checked_add(fdt.range.start)
-        .unwrap() as *const u8;
+        tracing::debug!("FDT region from boot_info: {:#x}..{:#x} (size: {})",
+            fdt.range.start, fdt.range.end, fdt.range.end.saturating_sub(fdt.range.start));
 
-    // Safety: we need to trust the bootinfo data is correct
-    let slice =
-        unsafe { slice::from_raw_parts(base, fdt.range.end.checked_sub(fdt.range.start).unwrap()) };
-    (
-        slice,
-        Range::from(PhysicalAddress::new(fdt.range.start)..PhysicalAddress::new(fdt.range.end)),
-    )
+        let base = boot_info
+            .physical_address_offset
+            .checked_add(fdt.range.start)
+            .unwrap() as *const u8;
+
+        // Safety: we need to trust the bootinfo data is correct
+        let slice =
+            unsafe { slice::from_raw_parts(base, fdt.range.end.checked_sub(fdt.range.start).unwrap()) };
+        (
+            slice,
+            Range::from(PhysicalAddress::new(fdt.range.start)..PhysicalAddress::new(fdt.range.end)),
+        )
+    }
 }

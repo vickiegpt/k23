@@ -561,37 +561,16 @@ static AP_TRAMPOLINE_CODE: &[u8] = &[
     // Signal that this AP has started (write 1 to cpu_started_flag at 0x703C)
     0x48, 0xC7, 0x04, 0x25, 0x3C, 0x70, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov qword ptr [0x703C], 1
 
-    // DEBUG: Halt here to verify signal works, before spin loop
+    // APs halt here and wait for kernel to wake them via IPI
+    // The kernel is responsible for bringing up APs when it's ready
+    // APs are in long mode with:
+    // - Stack set up at stack_top
+    // - TLS/FS base configured
+    // - Page tables loaded (same as BSP)
+    // Kernel can send INIT-SIPI to wake them, or use a different mechanism
+    0xFB,                               // sti - enable interrupts so IPI can wake us
     0xF4,                               // hlt
-    0xEB, 0xFD,                         // jmp $-1
-
-    // TODO: Enable spin loop and kernel jump after debugging
-    // // Wait for BSP to allow kernel entry (spin on kernel_entry_allowed at 0x704C)
-    // // spin_loop:
-    // 0xF3, 0x90,                         // pause (2 bytes)
-    // 0x48, 0x8B, 0x04, 0x25, 0x4C, 0x70, 0x00, 0x00, // mov rax, [0x704C] (8 bytes)
-    // 0x48, 0x85, 0xC0,                   // test rax, rax (3 bytes)
-    // 0x74, 0xF1,                         // je spin_loop (-15 bytes)
-    //
-    // // Load kernel entry point from AP data (0x7014 = kernel_entry)
-    // 0x48, 0x8B, 0x04, 0x25, 0x14, 0x70, 0x00, 0x00, // mov rax, [0x7014]
-    //
-    // // Set up arguments for kernel entry (System V ABI)
-    // // rdi = cpu_id from AP data (0x7044)
-    // 0x48, 0x8B, 0x3C, 0x25, 0x44, 0x70, 0x00, 0x00, // mov rdi, [0x7044]
-    //
-    // // rsi = boot_info pointer from AP data (0x7024)
-    // 0x48, 0x8B, 0x34, 0x25, 0x24, 0x70, 0x00, 0x00, // mov rsi, [0x7024]
-    //
-    // // rdx = boot_ticks from AP data (0x702C)
-    // 0x48, 0x8B, 0x14, 0x25, 0x2C, 0x70, 0x00, 0x00, // mov rdx, [0x702C]
-    //
-    // // Jump to kernel
-    // 0xFF, 0xE0,                         // jmp rax
-    //
-    // // Halt (should never reach here)
-    // 0xF4,                               // hlt
-    // 0xEB, 0xFD,                         // jmp $-1
+    0xEB, 0xFC,                         // jmp $-2 (back to hlt)
 ];
 
 /// Map the APIC region (identity-mapped for direct access)
@@ -747,14 +726,7 @@ pub fn start_secondary_harts(
         }
     }
 
-    log::info!("SMP initialization complete");
-
-    // Allow all APs to enter the kernel now
-    let ap_data = (init.phys_offset + AP_DATA_ADDR) as *mut ApStartupData;
-    unsafe {
-        core::ptr::addr_of_mut!((*ap_data).kernel_entry_allowed).write_unaligned(1);
-    }
-    log::debug!("Released APs to enter kernel");
+    log::info!("SMP initialization complete - {} APs halted and ready for kernel wakeup", cpu_count - 1);
 
     Ok(())
 }

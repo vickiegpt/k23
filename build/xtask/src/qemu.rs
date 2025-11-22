@@ -74,7 +74,7 @@ pub fn spawn(
             let mut cmd = Command::new("qemu-system-x86_64");
             // println!("{}", image.to_str().unwrap());
             cmd.args([
-                "-s", "-S",
+                // "-s", "-S",
                 "-cpu",
                 "qemu64",
                 "-d",
